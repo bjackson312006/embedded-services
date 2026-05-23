@@ -12,6 +12,7 @@
 pub mod task;
 
 use embassy_sync::channel::Channel;
+use embassy_sync::mutex::Mutex;
 use embedded_io_async::Read as UartRead;
 use embedded_io_async::Write as UartWrite;
 use embedded_services::GlobalRawMutex;
@@ -67,6 +68,15 @@ pub struct Service<R: RelayHandler, M: MctpMedium + Copy> {
     relay_handler: R,
     medium: M,
     reply_context: mctp_rs::MctpReplyContext<M>,
+
+    rx_state: Mutex<GlobalRawMutex, RxState>,
+    // u_Note: I'm using GlobalRawMutex here because that's what espi-service uses
+    // u_Note: If `Service` is never meant to be passed around by-value than this is probably fine, but if not having the buffer live directly in the struct (instead of a reference) is probably quite expensive? I think espi-service has a 'Resources' pattern that it uses to maybe help with this
+}
+
+struct RxState {
+    buf: [u8; BUF_SIZE],
+    filled: usize,
 }
 
 impl<R: RelayHandler, M: MctpMedium + Copy> Service<R, M> {
@@ -76,6 +86,7 @@ impl<R: RelayHandler, M: MctpMedium + Copy> Service<R, M> {
             relay_handler,
             medium,
             reply_context,
+            rx_state: Mutex::new(RxState { buf: [0; BUF_SIZE], filled: 0 })
         })
     }
 
@@ -108,12 +119,13 @@ impl<R: RelayHandler, M: MctpMedium + Copy> Service<R, M> {
     }
 
     async fn wait_for_request<T: UartRead>(&self, uart: &mut T) -> Result<(), Error<M>> {
+
         // Incremental read loop: read bytes, ask the medium whether the
         // assembled prefix is a complete frame, repeat until it is.
-        let mut buf = [0u8; BUF_SIZE];
-        let mut filled = 0usize;
+        let mut rx_state = self.rx_state.lock().await;
         let packet_len = loop {
-            let dst = buf.get_mut(filled..).ok_or(Error::Serialize("buffer overrun"))?;
+            let buf_len = rx_state.filled;
+            let dst = rx_state.buf.get_mut(buf_len..).ok_or(Error::Serialize("buffer overrun"))?;
             if dst.is_empty() {
                 return Err(Error::Serialize("frame exceeds BUF_SIZE"));
             }
@@ -121,10 +133,10 @@ impl<R: RelayHandler, M: MctpMedium + Copy> Service<R, M> {
             if n == 0 {
                 return Err(Error::Comms);
             }
-            filled += n;
+            rx_state.filled += n;
             match self
                 .medium
-                .frame_complete(buf.get(..filled).ok_or(Error::Serialize("buffer overrun"))?)
+                .frame_complete(rx_state.buf.get(..rx_state.filled).ok_or(Error::Serialize("buffer overrun"))?)
                 .map_err(Error::Mctp)?
             {
                 Some(len) => break len,
@@ -137,7 +149,7 @@ impl<R: RelayHandler, M: MctpMedium + Copy> Service<R, M> {
 
         let message = mctp_ctx
             .deserialize_packet(
-                buf.get(..packet_len)
+                rx_state.buf.get(..packet_len)
                     .ok_or(Error::Serialize("frame exceeds BUF_SIZE"))?,
             )
             .map_err(Error::Mctp)?
@@ -153,6 +165,11 @@ impl<R: RelayHandler, M: MctpMedium + Copy> Service<R, M> {
                 message: response,
             })
             .map_err(|_| Error::Comms)?;
+
+        // Shift leftover bytes back to the start of the buffer
+        let buf_len = rx_state.filled;
+        rx_state.buf.copy_within(packet_len..buf_len, 0);
+        rx_state.filled = buf_len - packet_len;
 
         Ok(())
     }
